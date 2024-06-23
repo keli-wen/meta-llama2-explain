@@ -257,53 +257,136 @@ class Llama:
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
-        params = self.model.params
+        # Get model build parameters.
+        params: ModelArgs = self.model.params
         bsz = len(prompt_tokens)
-        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
+        # Ensure the current batch size does not exceed the maximum batch size.
+        assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
+
+        # Ensure the longest prompt length does not exceed the maximum sequence length.
         assert max_prompt_len <= params.max_seq_len
+
+        # Calculate the expected total length of the generated sequence. (for memory preallocation)
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
+        # Pre-construct the generation sequence tensor, filling it entirely with padding tokens.
+        # [Shape] tokens: (batch_size, total_len)
         tokens = torch.full(
             (bsz, total_len), pad_id, dtype=torch.long, device="cuda"
         )
+
+        # Initialize the generation sequence tensor based on the input prompts.
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(
                 t, dtype=torch.long, device="cuda"
             )
+
+        # Initialize log probabilities if needed. Clearly, the shape of the log
+        # probability tensor matches the generation sequence tensor.
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
+        # Record the position of the last sampled token.
         prev_pos = 0
+
+        # Determine if any sequence has reached the end-of-sequence token.
+        # (i.e., if the sequence generation is complete)
         eos_reached = torch.tensor([False] * bsz, device="cuda")
+
+        # Input text mask, used to determine if the current position is an input token.
+        # eg. input_text_mask[0, 0:3] = [True, True, False] means the first two
+        # positions are input tokens.
         input_text_mask = tokens != pad_id
+
+        # If the shortest prompt length equals the total length, no new tokens will be generated,
+        # thus directly calculating log probabilities.
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos)
+            ##################################################################################
+            # Q: Why perform the logits.transpose(1, 2) operation when calculating log
+            # probabilities?
+            # A: The shape of logits is (batch_size, seq_len, vocab_size).
+            # The documentation specifies that input must be in the form [C], [N, C],
+            # [N, C, d1, d2, ...], etc.
+            # Where C represents the number of classes, and N represents the batch size.
+            # Therefore, a transpose operation is needed.
+            # https://pytorch.org/docs/stable/generated/torch.nn.functional.cross_entropy.html
+            ##################################################################################
             token_logprobs = -F.cross_entropy(
                 input=logits.transpose(1, 2),
                 target=tokens,
                 reduction="none",
                 ignore_index=pad_id,
             )
-
+        # Start generating tokens from the minimum prompt length.
+        # This ensures that the first generated tokens are meaningful.
+        # If token generation starts from a position less than min_prompt_len,
+        # the generated tokens will all be part of the already given prompt tokens.
+        # ┌────────────────────────────┐
+        # │ x: prompt token.           │
+        # │ .: padding token.          │
+        # │ g: generated token.        │
+        # │                            │
+        # │ Start from min_prompt_len. │
+        # │           ↓                │
+        # │ B1 [x][x][x][.][.][.]      │
+        # │ B2 [x][x][.][.][.][.]      │
+        # │ B3 [x][x][x][x][.][.]      │
+        # │                            │
+        # │ After one generation step. │
+        # │                            │
+        # │              ↓             │
+        # │ B1 [x][x][x][.][.][.]      │
+        # │ B2 [x][x][g][.][.][.]      │
+        # │ B3 [x][x][x][x][.][.]      │
+        # └────────────────────────────┘
         for cur_pos in range(min_prompt_len, total_len):
+            ###############################################################################
+            # Q: Why only provide tokens from [prev_pos:cur_pos]? Why not the entire tokens?
+            # A: First, prev_pos represents the position from the last processing step,
+            # initially 0.
+            # The reason for providing only the tokens from [prev_pos:cur_pos] is due to the
+            # KV Cache.
+            # This way, there's no need to input the entire tokens each time.
+            #
+            # prev_pos mainly has two cases:
+            # 1) When prev_pos = 0. This indicates the first generation step,
+            # so we need to input tokens from [0:min_prompt_len].
+            #    Compute the KV Cache for [0:min_prompt_len] and generate the next token.
+            # 2) When prev_pos > 0. This means some tokens have already been generated,
+            #    and cur_pos is always prev_pos + 1.
+            #    In this case, input only one token each time, leveraging the cached KV Cache
+            #    to generate the next token.
+            ###############################################################################
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+
             if temperature > 0:
+                # Adjust probability distribution via temperature to achieve controlled randomness.
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                # Use top-p sampling to get the next token.
+                # [Shape] next_token: (batch_size, 1)
                 next_token = sample_top_p(probs, top_p)
             else:
+                # Otherwise, directly select the token with the highest probability. (no randomness)
+                # [Shape] next_token: (batch_size, 1)
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
+            # [Shape] next_token: (batch_size, 1) -> (batch_size, )
             next_token = next_token.reshape(-1)
-            # only replace token if prompt has already been generated
+
+            # If the generated token is an input token, do not update.
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
             )
             tokens[:, cur_pos] = next_token
+
             if logprobs:
+                # Update log probabilities. Refer to the earlier comment for understanding
+                # logits.transpose(1, 2).
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = (
                     -F.cross_entropy(
                         input=logits.transpose(1, 2),
@@ -312,26 +395,37 @@ class Llama:
                         ignore_index=pad_id,
                     )
                 )
+
+            # Check if any sequence has finished generation.
+            # 1. (~input_text_mask[:, cur_pos]) indicates the current position is a
+            # generated token, not an input token.
+            # 2. next_token == self.tokenizer.eos_id indicates the generated token is the
+            # end-of-sequence token.
+            # If both conditions are met, the generation process is complete for that sequence.
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 next_token == self.tokenizer.eos_id
             )
             prev_pos = cur_pos
+            # End the process if all sequences have reached the end-of-sequence token.
             if all(eos_reached):
                 break
 
+        # Steps to construct the output result.
         if logprobs:
             token_logprobs = token_logprobs.tolist()
         out_tokens, out_logprobs = [], []
         for i, toks in enumerate(tokens.tolist()):
-            # cut to max gen len
+            # If echo is True, the output should include the original prompt, so start from 0.
             start = 0 if echo else len(prompt_tokens[i])
+            # Truncate to the maximum generation length.
             toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
             probs = None
             if logprobs:
                 probs = token_logprobs[i][
                     start : len(prompt_tokens[i]) + max_gen_len
                 ]
-            # cut to eos tok if any
+            # If the sequence contains an end-of-sequence token (indicating early termination),
+            # truncate to the EOS position.
             if self.tokenizer.eos_id in toks:
                 eos_idx = toks.index(self.tokenizer.eos_id)
                 toks = toks[:eos_idx]
@@ -544,7 +638,8 @@ class Llama:
             logprobs=logprobs,
         )
 
-        # Construct the chat predictions based on the generated tokens.
+        # If logprobs is True, return a list of dictionaries containing the generated text,
+        # generated tokens, and their log probabilities.
         if logprobs:
             return [
                 {
@@ -563,6 +658,7 @@ class Llama:
                     generation_tokens, generation_logprobs, unsafe_requests
                 )
             ]
+        # Otherwise, return a list of dictionaries containing only the generated text.
         return [
             {
                 "generation": {
